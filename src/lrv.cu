@@ -698,6 +698,44 @@ PerformanceMetrics benchmarkLogVarianceRatio(bool useAlpha, bool useWeighted, fl
     cudaMalloc(&d_variances, size_pairs);
 
     // Copy data to device.
+    // Warmup runs to get GPU into steady state
+    const int NUM_WARMUP = 5;
+    printf("\nPerforming %d warmup iterations...\n", NUM_WARMUP);
+    
+    // Do warmup iterations
+    for(int i = 0; i < NUM_WARMUP; i++) {
+        dim3 blockDim(16, 16);
+        dim3 gridDim((nb_genes + blockDim.x - 1) / blockDim.x, (nb_genes + blockDim.y - 1) / blockDim.y);
+        // Warmup memory transfers
+        cudaMemcpy(d_Y, h_Y, size_Y, cudaMemcpyHostToDevice);
+        if (useAlpha) cudaMemcpy(d_Yfull, h_Yfull, size_Y, cudaMemcpyHostToDevice);
+        if (useWeighted) {
+            cudaMemcpy(d_W, h_W, size_W, cudaMemcpyHostToDevice);
+            if (useAlpha) cudaMemcpy(d_Wfull, h_Wfull, size_W, cudaMemcpyHostToDevice);
+        }
+
+        if (useAlpha) {
+            if (useWeighted) {
+                computeLrvAlphaWeighted<<<gridDim, blockDim>>>(d_Y, d_Yfull, d_W, d_Wfull, a, d_variances, nb_samples, nb_genes);
+            } else {
+                computeLrvAlpha<<<gridDim, blockDim>>>(d_Y, d_Yfull, a, d_variances, nb_samples, nb_genes);
+            }
+        } else {
+            if (useWeighted) {
+                computeLrvWeighted<<<gridDim, blockDim>>>(d_Y, d_W, d_variances, nb_samples, nb_genes);
+            } else {
+                computeLrvBasic<<<gridDim, blockDim>>>(d_Y, d_variances, nb_samples, nb_genes);
+            }
+        }
+        
+        // Warmup device synchronization and memory transfers back
+        cudaMemcpy(h_variances_gpu, d_variances, size_pairs, cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+    }
+
+    printf("Warmup complete. Starting timed runs...\n\n");
+
+    // Now do the actual timed run
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -751,39 +789,44 @@ PerformanceMetrics benchmarkLogVarianceRatio(bool useAlpha, bool useWeighted, fl
 
     // Calculate performance metrics.
     metrics.total_time = metrics.kernel_time + metrics.memory_time;
-    // A rough estimate: assume ~2*nb_samples per gene pair.
-
+    // Estimate the FLOP count per gene–pair.
     long long flops_per_pair = 0;
-    const int samples = nb_samples;
-
     if (useAlpha) {
-        // α-transformation branch operations
-        const int pow_ops = 40; // 4 powf calls @ 10 FLOPs each
-        const int weight_ops = useWeighted ? 5 : 0;
-        const int core_ops = 15; // divisions, differences, squares
-
-        flops_per_pair = samples * (pow_ops + weight_ops + core_ops)
-                       + 100; // pair-level ops
+        // In the α–branch, each sample does:
+        //   – 4 calls to __powf (assume 10 FLOPs each): 40 FLOPs
+        //   – Other arithmetic updates (additions, subtractions, FMAs, etc.): ~15 FLOPs
+        // Plus an extra ~100 FLOPs for the pair–level (final reductions)
+        const int pow_ops  = 40;      // 4 powf’s @ 10 FLOPs each
+        const int weight_ops = useWeighted ? 5 : 0;  // extra per–sample if weighted
+        const int core_ops = 15;      // arithmetic (add, sub, FMA, etc.)
+        flops_per_pair = nb_samples * (pow_ops + weight_ops + core_ops) + 100;
     } else {
-        // Log-ratio branch operations
-        const int log_ops = 20; // 2 logf calls @ 10 FLOPs each
-        const int weight_ops = useWeighted ? 8 : 0;
-        const int core_ops = 10; // mean, variance
-
-        flops_per_pair = samples * (log_ops + weight_ops + core_ops)
-                       + 50; // pair-level ops
+        // In the log–ratio branch, each sample does:
+        //   – one division + one log (assume 10 FLOPs each → 20 FLOPs)
+        //   – Two FMA operations (assume 2 FLOPs each → 4 FLOPs)
+        //   → Total per sample ≈ 24 FLOPs
+        // Plus an extra ~5 FLOPs for the pair–level (final computations)
+        const int log_ops = 20;       // division + log
+        const int weight_ops = useWeighted ? 8 : 0;  // extra if weighted
+        const int core_ops = 4;       // two FMAs, etc.
+        flops_per_pair = nb_samples * (log_ops + weight_ops + core_ops) + 5;
     }
 
-    float operations  = num_pairs * flops_per_pair * 1.0f;
+    // Now, total FLOPs is the number of pairs times the FLOPs per pair.
+    double total_ops = (double)num_pairs * flops_per_pair;
+    metrics.gflops   = total_ops / (metrics.kernel_time * 1e-3 * 1e9);
+    float cpu_gflops = (total_ops / 1e9f) / (cpu_time / 1000.0f);
+    double bytes_transferred = 0.0;
+    bytes_transferred += size_Y;  // Y matrix always
+    if (useAlpha) bytes_transferred += size_Y;  // Yfull matrix
+    if (useWeighted) {
+        bytes_transferred += size_Y;  // W matrix
+        if (useAlpha) bytes_transferred += size_Y;  // Wfull matrix
+    }
+    
+    bytes_transferred += size_pairs; 
+    metrics.bandwidth = bytes_transferred / (metrics.memory_time * 1e6f);  // Convert to GB/s
 
-    // Calculate GFLOPS after kernel execution
-    metrics.gflops = (operations* 1e-9f)
-                   / (metrics.kernel_time * 1e-3f);
-
-
-    float cpu_gflops = (operations / 1e9f) / (cpu_time / 1000.0f);
-    // Bandwidth: estimate bytes transferred: 3 matrices (read Y, write variances, plus extra if weights)
-    metrics.bandwidth = (3.0f * nb_samples * nb_genes * sizeof(float)) / (metrics.total_time * 1e6f);
 
     bool correct = verifyResults(h_variances_gpu, h_variances_cpu, num_pairs);
     printf("\nResults: %s\n", correct ? "PASSED" : "FAILED");
