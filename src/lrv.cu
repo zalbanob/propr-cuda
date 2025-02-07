@@ -825,6 +825,7 @@ PerformanceMetrics benchmarkLogVarianceRatio(bool useAlpha, bool useWeighted, fl
     }
     
     bytes_transferred += size_pairs; 
+    bytes_transferred *= 2;
     metrics.bandwidth = bytes_transferred / (metrics.memory_time * 1e6f);  // Convert to GB/s
 
 
